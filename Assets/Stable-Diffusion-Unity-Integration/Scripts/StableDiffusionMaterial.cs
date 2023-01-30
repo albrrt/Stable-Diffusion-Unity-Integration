@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using UnityEngine;
+using UnityEngine.Networking;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -262,111 +263,92 @@ public class StableDiffusionMaterial : MonoBehaviour
         yield return sdc.SetModelAsync(modelsList[selectedModel]);
 
         // Generate the image
-        HttpWebRequest httpWebRequest = null;
+        // Create Post Data
+        SDParamsIn sd = new SDParamsIn();
+        sd.prompt = prompt;
+        sd.negative_prompt = negativePrompt;
+        sd.steps = steps;
+        sd.cfg_scale = cfgScale;
+        sd.width = width;
+        sd.height = height;
+        sd.seed = seed;
+        sd.tiling = false;
 
-        try
+        if (selectedSampler >= 0 && selectedSampler < samplersList.Length)
+            sd.sampler_name = samplersList[selectedSampler];
+
+        // Serialize the input parameters
+        string postData = JsonConvert.SerializeObject(sd);
+        // Make a HTTP POST request to the Stable Diffusion server
+        // Send the generation parameters along with the POST request
+        UnityWebRequest request = UnityWebRequest.Put(sdc.settings.StableDiffusionServerURL + sdc.settings.TextToImageAPI, postData);
+        request.method = "POST";
+        request.SetRequestHeader("Content-Type", "application/json");
+        request.downloadHandler = new DownloadHandlerBuffer();
+        yield return request.SendWebRequest();
+
+        if (request.result == UnityWebRequest.Result.ConnectionError)
         {
-            // Make a HTTP POST request to the Stable Diffusion server
-            httpWebRequest = (HttpWebRequest)WebRequest.Create(sdc.settings.StableDiffusionServerURL + sdc.settings.TextToImageAPI);
-            httpWebRequest.ContentType = "application/json";
-            httpWebRequest.Method = "POST";
-
-            // Send the generation parameters along with the POST request
-            using (var streamWriter = new StreamWriter(httpWebRequest.GetRequestStream()))
+            Debug.LogError("Connection Error while sending request to Stable Diffusion server: " + request.error);
+        }
+        else
+        {
+            // Deserialize the JSON string into a data structure
+            SDResponse json = JsonConvert.DeserializeObject<SDResponse>(request.downloadHandler.text);
+            // If no image, there was probably an error so abort
+            if (json.images == null || json.images.Length == 0)
             {
-                SDParamsIn sd = new SDParamsIn();
-                sd.prompt = prompt;
-                sd.negative_prompt = negativePrompt;
-                sd.steps = steps;
-                sd.cfg_scale = cfgScale;
-                sd.width = width;
-                sd.height = height;
-                sd.seed = seed;
-                sd.tiling = tiling;
+                Debug.LogError("No image was return by the server. This should not happen. Verify that the server is correctly setup.");
 
-                if (selectedSampler >= 0 && selectedSampler < samplersList.Length)
-                    sd.sampler_name = samplersList[selectedSampler];
-
-                // Serialize the input parameters
-                string json = JsonConvert.SerializeObject(sd);
-
-                // Send to the server
-                streamWriter.Write(json);
+                generating = false;
+                yield break;
             }
-        }
-        catch (Exception e)
-        {
-            Debug.LogError(e.Message + "\n\n" + e.StackTrace);
-        }
 
-        // Read the output of generation
-        if (httpWebRequest != null)
-        {
-            // Read the response from the server
-            var httpResponse = (HttpWebResponse)httpWebRequest.GetResponse();
+            // Decode the image from Base64 string into an array of bytes
+            byte[] imageData = Convert.FromBase64String(json.images[0]);
 
-            using (var streamReader = new StreamReader(httpResponse.GetResponseStream()))
+            // Write it in the specified project output folder
+            using (FileStream imageFile = new FileStream(filename, FileMode.Create))
             {
-                // Decode the response as a JSON string
-                string result = streamReader.ReadToEnd();
-
-                // Deserialize the JSON string into a data structure
-                SDResponse json = JsonConvert.DeserializeObject<SDResponse>(result);
-
-                // If no image, there was probably an error so abort
-                if (json.images == null || json.images.Length == 0)
-                {
-                    Debug.LogError("No image was return by the server. This should not happen. Verify that the server is correctly setup.");
-
-                    generating = false;
-                    yield break;
-                }
-
-                // Decode the image from Base64 string into an array of bytes
-                byte[] imageData = Convert.FromBase64String(json.images[0]);
-
-                // Write it in the specified project output folder
-                using (FileStream imageFile = new FileStream(filename, FileMode.Create))
-                {
 #if UNITY_EDITOR
-                    AssetDatabase.StartAssetEditing();
+                AssetDatabase.StartAssetEditing();
 #endif
-                    yield return imageFile.WriteAsync(imageData, 0, imageData.Length);
+                yield return imageFile.WriteAsync(imageData, 0, imageData.Length);
 #if UNITY_EDITOR
-                    AssetDatabase.StopAssetEditing();
-                    AssetDatabase.SaveAssets();
+                AssetDatabase.StopAssetEditing();
+                AssetDatabase.SaveAssets();
 #endif
-                }
+            }
 
-                try
+            try
+            {
+                // Read back the image into a texture
+                if (File.Exists(filename))
                 {
-                    // Read back the image into a texture
-                    if (File.Exists(filename))
-                    {
-                        Texture2D texture = new Texture2D(2, 2);
-                        texture.LoadImage(imageData);
-                        texture.Apply();
-                    
-                        LoadIntoMaterial(texture);
-                    }
+                    Texture2D texture = new Texture2D(2, 2);
+                    texture.LoadImage(imageData);
+                    texture.Apply();
 
-                    // Read the generation info back (only seed should have changed, as the generation picked a particular seed)
-                    if (json.info != "")
-                    {
-                        SDParamsOut info = JsonConvert.DeserializeObject<SDParamsOut>(json.info);
-
-                        // Read the seed that was used by Stable Diffusion to generate this result
-                        generatedSeed = info.seed;
-                    }
+                    LoadIntoMaterial(texture);
                 }
-                catch (Exception e)
+
+                // Read the generation info back (only seed should have changed, as the generation picked a particular seed)
+                if (json.info != "")
                 {
-                    Debug.LogError(e.Message + "\n\n" + e.StackTrace);
+                    SDParamsOut info = JsonConvert.DeserializeObject<SDParamsOut>(json.info);
+
+                    // Read the seed that was used by Stable Diffusion to generate this result
+                    generatedSeed = info.seed;
                 }
+            }
+            catch (Exception e)
+            {
+                Debug.LogError(e.Message + "\n\n" + e.StackTrace);
             }
         }
 
         generating = false;
+        request.Dispose();
         yield return null;
     }
 
