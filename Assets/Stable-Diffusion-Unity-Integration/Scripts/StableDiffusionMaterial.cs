@@ -5,7 +5,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using UnityEngine;
-using UnityEngine.Networking;
+using System.Threading.Tasks;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -16,7 +16,7 @@ using UnityEditor.SceneManagement;
 /// Component to help generate a Material Texture using Stable Diffusion.
 /// </summary>
 [ExecuteAlways]
-public class StableDiffusionMaterial : MonoBehaviour
+public class StableDiffusionMaterial : StableDiffusionGenerator
 {
     [ReadOnly]
     public string guid = "";
@@ -67,7 +67,6 @@ public class StableDiffusionMaterial : MonoBehaviour
 
     string filename = "";
 
-    static private StableDiffusionConfiguration sdc = null;
     private Texture2D generatedTexture = null;
     private Texture2D generatedNormal = null;
 
@@ -126,6 +125,14 @@ public class StableDiffusionMaterial : MonoBehaviour
         }
 #endif
     }
+
+    private void Start()
+    {
+#if UNITY_EDITOR
+        EditorUtility.ClearProgressBar();
+#endif
+    }
+
 
     /// <summary>
     /// Get the mesh renderer in this object, or in childrens if allowed.
@@ -263,133 +270,124 @@ public class StableDiffusionMaterial : MonoBehaviour
         yield return sdc.SetModelAsync(modelsList[selectedModel]);
 
         // Generate the image
-        // Create Post Data
-        SDParamsIn sd = new SDParamsIn();
-        sd.prompt = prompt;
-        sd.negative_prompt = negativePrompt;
-        sd.steps = steps;
-        sd.cfg_scale = cfgScale;
-        sd.width = width;
-        sd.height = height;
-        sd.seed = seed;
-        sd.tiling = false;
+        HttpWebRequest httpWebRequest = null;
 
-        if (selectedSampler >= 0 && selectedSampler < samplersList.Length)
-            sd.sampler_name = samplersList[selectedSampler];
-
-        // Serialize the input parameters
-        string postData = JsonConvert.SerializeObject(sd);
-        // Make a HTTP POST request to the Stable Diffusion server
-        // Send the generation parameters along with the POST request
-        UnityWebRequest request = UnityWebRequest.Put(sdc.settings.StableDiffusionServerURL + sdc.settings.TextToImageAPI, postData);
-        request.method = "POST";
-        request.SetRequestHeader("Content-Type", "application/json");
-        request.downloadHandler = new DownloadHandlerBuffer();
-        yield return request.SendWebRequest();
-
-        if (request.result == UnityWebRequest.Result.ConnectionError)
+        try
         {
-            Debug.LogError("Connection Error while sending request to Stable Diffusion server: " + request.error);
-        }
-        else
-        {
-            // Deserialize the JSON string into a data structure
-            SDResponse json = JsonConvert.DeserializeObject<SDResponse>(request.downloadHandler.text);
-            // If no image, there was probably an error so abort
-            if (json.images == null || json.images.Length == 0)
+            // Make a HTTP POST request to the Stable Diffusion server
+            httpWebRequest = (HttpWebRequest)WebRequest.Create(sdc.settings.StableDiffusionServerURL + sdc.settings.TextToImageAPI);
+            httpWebRequest.ContentType = "application/json";
+            httpWebRequest.Method = "POST";
+
+            // Send the generation parameters along with the POST request
+            using (var streamWriter = new StreamWriter(httpWebRequest.GetRequestStream()))
             {
-                Debug.LogError("No image was return by the server. This should not happen. Verify that the server is correctly setup.");
+                SDParamsIn sd = new SDParamsIn();
+                sd.prompt = prompt;
+                sd.negative_prompt = negativePrompt;
+                sd.steps = steps;
+                sd.cfg_scale = cfgScale;
+                sd.width = width;
+                sd.height = height;
+                sd.seed = seed;
+                sd.tiling = tiling;
 
-                generating = false;
-                yield break;
-            }
+                if (selectedSampler >= 0 && selectedSampler < samplersList.Length)
+                    sd.sampler_name = samplersList[selectedSampler];
 
-            // Decode the image from Base64 string into an array of bytes
-            byte[] imageData = Convert.FromBase64String(json.images[0]);
+                // Serialize the input parameters
+                string json = JsonConvert.SerializeObject(sd);
 
-            // Write it in the specified project output folder
-            using (FileStream imageFile = new FileStream(filename, FileMode.Create))
-            {
-#if UNITY_EDITOR
-                AssetDatabase.StartAssetEditing();
-#endif
-                yield return imageFile.WriteAsync(imageData, 0, imageData.Length);
-#if UNITY_EDITOR
-                AssetDatabase.StopAssetEditing();
-                AssetDatabase.SaveAssets();
-#endif
-            }
-
-            try
-            {
-                // Read back the image into a texture
-                if (File.Exists(filename))
-                {
-                    Texture2D texture = new Texture2D(2, 2);
-                    texture.LoadImage(imageData);
-                    texture.Apply();
-
-                    LoadIntoMaterial(texture);
-                }
-
-                // Read the generation info back (only seed should have changed, as the generation picked a particular seed)
-                if (json.info != "")
-                {
-                    SDParamsOut info = JsonConvert.DeserializeObject<SDParamsOut>(json.info);
-
-                    // Read the seed that was used by Stable Diffusion to generate this result
-                    generatedSeed = info.seed;
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.LogError(e.Message + "\n\n" + e.StackTrace);
+                // Send to the server
+                streamWriter.Write(json);
             }
         }
+        catch (Exception e)
+        {
+            Debug.LogError(e.Message + "\n\n" + e.StackTrace);
+        }
 
+        // Read the output of generation
+        if (httpWebRequest != null)
+        {
+            // Wait that the generation is complete before procedding
+            Task<WebResponse> t = httpWebRequest.GetResponseAsync();
+            while (!t.IsCompleted)
+            {
+                UpdateGenerationProgress();
+                yield return new WaitForSeconds(1);
+            }
+            var httpResponse = t.Result;
+
+            // Get response from the server
+            using (var streamReader = new StreamReader(httpResponse.GetResponseStream()))
+            {
+                // Wait for generation to be finished
+                //yield return UpdateGenerationProgress();
+
+                // Decode the response as a JSON string
+                string result = streamReader.ReadToEnd();
+
+                // Deserialize the JSON string into a data structure
+                SDResponse json = JsonConvert.DeserializeObject<SDResponse>(result);
+
+                // If no image, there was probably an error so abort
+                if (json.images == null || json.images.Length == 0)
+                {
+                    Debug.LogError("No image was return by the server. This should not happen. Verify that the server is correctly setup.");
+
+                    generating = false;
+                    yield break;
+                }
+
+                // Decode the image from Base64 string into an array of bytes
+                byte[] imageData = Convert.FromBase64String(json.images[0]);
+
+                // Write it in the specified project output folder
+                using (FileStream imageFile = new FileStream(filename, FileMode.Create))
+                {
+#if UNITY_EDITOR
+                    AssetDatabase.StartAssetEditing();
+#endif
+                    yield return imageFile.WriteAsync(imageData, 0, imageData.Length);
+#if UNITY_EDITOR
+                    AssetDatabase.StopAssetEditing();
+                    AssetDatabase.SaveAssets();
+#endif
+                }
+
+                try
+                {
+                    // Read back the image into a texture
+                    if (File.Exists(filename))
+                    {
+                        Texture2D texture = new Texture2D(2, 2);
+                        texture.LoadImage(imageData);
+                        texture.Apply();
+                    
+                        LoadIntoMaterial(texture);
+                    }
+
+                    // Read the generation info back (only seed should have changed, as the generation picked a particular seed)
+                    if (json.info != "")
+                    {
+                        SDParamsOut info = JsonConvert.DeserializeObject<SDParamsOut>(json.info);
+
+                        // Read the seed that was used by Stable Diffusion to generate this result
+                        generatedSeed = info.seed;
+                    }
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError(e.Message + "\n\n" + e.StackTrace);
+                }
+            }
+        }
+#if UNITY_EDITOR
+        EditorUtility.ClearProgressBar();
+#endif
         generating = false;
-        request.Dispose();
         yield return null;
-    }
-
-
-    /// <summary>
-    /// Find all the game objects that contains a certain component type.
-    /// </summary>
-    /// <typeparam name="T">Type of component to search for</typeparam>
-    /// <param name="g">Game object for which to search it's children</param>
-    /// <param name="active">The game object must be active (true) or can also be not active (false)</param>
-    /// <returns>Array of game object found, all of which containing a component of the specified type</returns>
-    public static T[] FindInChildrenAll<T>(GameObject g, bool active = true) where T : class
-    {
-        List<T> list = new List<T>();
-
-        // Search in all the children of the specified game object
-        foreach (Transform t in g.transform)
-        {
-            // GameObject has no children, skip it
-            if (t == null)
-                continue;
-
-            if (active && !t.gameObject.activeSelf)
-                continue;
-
-            // Found one, check component
-            T comp = t.GetComponent<T>();
-            if (comp != null && comp.ToString() != "null")
-                list.Add(comp);
-
-            // Recursively search into the children of this game object
-            T[] compo = FindInChildrenAll<T>(t.gameObject);
-            if (compo != null && compo.Length > 0)
-            {
-                foreach (T tt in compo)
-                    list.Add(tt);
-            }
-        }
-
-        // Not found, return null
-        return list.ToArray();
     }
 
 
